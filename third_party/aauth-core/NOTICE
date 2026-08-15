@@ -1,0 +1,13 @@
+Vendored subset of `aauth-core` (AAuth protocol primitives) used by the
+mcpg `dev.mcpg.identity.aauth` plugin.
+
+Source:  https://github.com/agentprovider/source-code
+Commit:  201118bd0da4b95cfc91f45c5e29ae5733d14aad
+Path:    crates/aauth-core/src/
+License: MIT OR Apache-2.0
+Copyright (c) 2026 apd contributors
+
+The modules under `src/aauth/` are copied verbatim (RFC 8037 / 7638 / 8941 /
+9421 primitives and their test vectors), with intra-crate `crate::` paths
+rewritten to `super::` and an SPDX header added. No logic changes. The full
+licence texts are in LICENSE-MIT and LICENSE-APACHE alongside this NOTICE.
