@@ -16,6 +16,7 @@ use crate::jwk::Jwk;
 use crate::jwt::{self, DecodedJwt};
 
 pub const TYP_AGENT: &str = "aa-agent+jwt";
+pub const TYP_PERSON: &str = "aa-person+jwt";
 pub const TYP_RESOURCE: &str = "aa-resource+jwt";
 pub const TYP_AUTH: &str = "aa-auth+jwt";
 pub const TYP_SUBSCRIBE: &str = "aa-subscribe+jwt";
@@ -23,6 +24,9 @@ pub const TYP_EVENT: &str = "aa-event+jwt";
 
 /// Agent-token maximum lifetime per the protocol spec (24 hours).
 pub const AGENT_TOKEN_MAX_TTL_SECS: u64 = 24 * 3600;
+
+/// Person-token maximum lifetime per the protocol spec (1 hour, a MUST).
+pub const PERSON_TOKEN_MAX_TTL_SECS: u64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cnf {
@@ -43,6 +47,27 @@ pub struct AgentTokenClaims {
     pub ps: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_agent: Option<String>,
+}
+
+/// Claims of an `aa-person+jwt` — a PS-issued token identifying the person an
+/// agent acts for, to exactly one resource. Carries identity and NO
+/// authorization: the spec forbids `scope` and `account` members outright.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonTokenClaims {
+    pub iss: String,
+    pub dwk: String,
+    pub aud: String,
+    /// Directed (pairwise) opaque person identifier — unique within `iss`
+    /// only. `(iss, sub)` is the identifier; `sub` alone is meaningless.
+    pub sub: String,
+    pub cnf: Cnf,
+    pub jti: String,
+    pub iat: u64,
+    pub exp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_s256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 /// Claims of an `aa-subscribe+jwt` (AAuth Events).
@@ -147,9 +172,242 @@ pub fn validate_agent_token(
     claims
         .cnf
         .jwk
-        .verifying_key()
+        .verify_key()
         .map_err(|_| err("cnf.jwk is not a usable key"))?;
     Ok(claims)
+}
+
+/// Structural + temporal validation of a decoded person token, after the JWT
+/// signature has been verified by the caller. `resource_identifier` is the
+/// verifying resource's own server identifier — the token's `aud` MUST equal
+/// it exactly.
+pub fn validate_person_token(
+    decoded: &DecodedJwt,
+    now: u64,
+    resource_identifier: &str,
+    insecure_dev: bool,
+) -> Result<PersonTokenClaims, TokenError> {
+    if decoded.header.typ.as_deref() != Some(TYP_PERSON) {
+        return Err(err("typ is not aa-person+jwt"));
+    }
+    // The spec forbids these members on a person token — a person token
+    // carries identity and no authorization, and only `typ` distinguishes it
+    // from an auth token. Reject rather than ignore, so a mis-minted token
+    // cannot smuggle authorization-shaped claims to downstream policy.
+    for forbidden in ["scope", "account"] {
+        if decoded.payload.get(forbidden).is_some() {
+            return Err(err(format!(
+                "person token carries the forbidden `{forbidden}` claim"
+            )));
+        }
+    }
+    let claims: PersonTokenClaims = serde_json::from_value(decoded.payload.clone())
+        .map_err(|e| err(format!("missing or invalid claims: {e}")))?;
+    if claims.dwk != "aauth-person.json" {
+        return Err(err("dwk is not aauth-person.json"));
+    }
+    crate::ident::validate_server_identifier(&claims.iss, insecure_dev)
+        .map_err(|_| err("iss is not a valid server identifier"))?;
+    if claims.aud != resource_identifier {
+        return Err(err(
+            "aud does not match this resource's identifier — the token was issued for a \
+             different resource",
+        ));
+    }
+    if claims.sub.is_empty() {
+        return Err(err("sub is empty"));
+    }
+    if claims.exp <= now {
+        return Err(err("person token expired"));
+    }
+    if claims.iat > now + 60 {
+        return Err(err("person token iat in the future"));
+    }
+    if claims.exp.saturating_sub(claims.iat) > PERSON_TOKEN_MAX_TTL_SECS {
+        return Err(err(format!(
+            "person token lifetime exceeds the {PERSON_TOKEN_MAX_TTL_SECS}s ceiling"
+        )));
+    }
+    claims
+        .cnf
+        .jwk
+        .require_fully_specified_alg()
+        .map_err(|e| err(format!("cnf.jwk: {e}")))?;
+    claims
+        .cnf
+        .jwk
+        .verify_key()
+        .map_err(|_| err("cnf.jwk is not a usable key"))?;
+    Ok(claims)
+}
+
+/// Claims of an `aa-auth+jwt` — the grant a PS (three-party) or AS
+/// (four-party) issues to an agent for exactly one resource. Carries what
+/// is authorized (`scope`), the person (`sub`, directed under `ps`), and the
+/// agent's key (`cnf`); never an agent identifier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthTokenClaims {
+    pub iss: String,
+    pub dwk: String,
+    pub aud: String,
+    pub jti: String,
+    /// The person server the person is represented by — equals `iss` when a
+    /// PS issued the token.
+    pub ps: String,
+    pub sub: String,
+    pub cnf: Cnf,
+    pub iat: u64,
+    pub exp: u64,
+    /// Space-separated scope values, when the grant carries any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mission_s256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+}
+
+impl AuthTokenClaims {
+    /// The granted scope values as a list.
+    pub fn scopes(&self) -> Vec<String> {
+        self.scope
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// Auth-token maximum lifetime per the protocol spec (1 hour, a MUST).
+pub const AUTH_TOKEN_MAX_TTL_SECS: u64 = 3600;
+
+/// Structural + temporal validation of a decoded auth token, after the JWT
+/// signature has been verified by the caller. `resource_identifier` is the
+/// verifying resource's own server identifier — `aud` MUST equal it exactly.
+/// The caller decides which `dwk` it accepts (`aauth-person.json` from a
+/// trusted PS, `aauth-access.json` from a trusted AS) and passes it here.
+pub fn validate_auth_token(
+    decoded: &DecodedJwt,
+    now: u64,
+    resource_identifier: &str,
+    expected_dwk: &str,
+    insecure_dev: bool,
+) -> Result<AuthTokenClaims, TokenError> {
+    if decoded.header.typ.as_deref() != Some(TYP_AUTH) {
+        return Err(err("typ is not aa-auth+jwt"));
+    }
+    let claims: AuthTokenClaims = serde_json::from_value(decoded.payload.clone())
+        .map_err(|e| err(format!("missing or invalid claims: {e}")))?;
+    if claims.dwk != expected_dwk {
+        return Err(err(format!("dwk is not {expected_dwk}")));
+    }
+    crate::ident::validate_server_identifier(&claims.iss, insecure_dev)
+        .map_err(|_| err("iss is not a valid server identifier"))?;
+    crate::ident::validate_server_identifier(&claims.ps, insecure_dev)
+        .map_err(|_| err("ps is not a valid server identifier"))?;
+    // A PS-issued auth token names itself as the person server.
+    if expected_dwk == "aauth-person.json" && claims.ps != claims.iss {
+        return Err(err("ps does not equal iss on a PS-issued auth token"));
+    }
+    if claims.aud != resource_identifier {
+        return Err(err(
+            "aud does not match this resource's identifier — the token was issued for a \
+             different resource",
+        ));
+    }
+    if claims.sub.is_empty() {
+        return Err(err("sub is empty"));
+    }
+    if claims.exp <= now {
+        return Err(err("auth token expired"));
+    }
+    if claims.iat > now + 60 {
+        return Err(err("auth token iat in the future"));
+    }
+    if claims.exp.saturating_sub(claims.iat) > AUTH_TOKEN_MAX_TTL_SECS {
+        return Err(err(format!(
+            "auth token lifetime exceeds the {AUTH_TOKEN_MAX_TTL_SECS}s ceiling"
+        )));
+    }
+    claims
+        .cnf
+        .jwk
+        .require_fully_specified_alg()
+        .map_err(|e| err(format!("cnf.jwk: {e}")))?;
+    claims
+        .cnf
+        .jwk
+        .verify_key()
+        .map_err(|_| err("cnf.jwk is not a usable key"))?;
+    Ok(claims)
+}
+
+/// Resource-token maximum lifetime per the protocol spec (5 minutes, a
+/// SHOULD NOT exceed; person servers enforce it as a hard cap).
+pub const RESOURCE_TOKEN_MAX_TTL_SECS: u64 = 300;
+
+/// What a resource puts into an `aa-resource+jwt`: the signed statement of
+/// the access it wants a person server (or access server) to authorize.
+#[derive(Debug, Clone)]
+pub struct ResourceTokenRequest<'a> {
+    /// The resource's own server identifier (`iss`).
+    pub resource: &'a str,
+    /// The token's audience — the PS (three-party) or AS (four-party) URL.
+    pub aud: &'a str,
+    /// The `iss` of the person token the resource verified.
+    pub ps: &'a str,
+    /// The `sub` of that person token.
+    pub sub: &'a str,
+    /// The `jti` of that person token (`presented_jti`).
+    pub presented_jti: &'a str,
+    /// RFC 7638 thumbprint of the agent's signing key.
+    pub agent_jkt: &'a str,
+    /// Space-separated scope values being requested.
+    pub scope: &'a str,
+    pub account: Option<&'a str>,
+    /// REQUIRED when the person token carried one — copied unchanged.
+    pub mission_s256: Option<&'a str>,
+    pub tenant: Option<&'a str>,
+    /// Lifetime, seconds; clamped to [`RESOURCE_TOKEN_MAX_TTL_SECS`].
+    pub ttl_secs: u64,
+}
+
+/// Mint and sign a resource token with the resource's Ed25519 key. Returns
+/// the compact JWT and its `jti`.
+pub fn issue_resource_token(
+    req: &ResourceTokenRequest<'_>,
+    kid: &str,
+    key: &crate::jwk::SigningKey,
+    now: u64,
+) -> (String, String) {
+    let ttl = req.ttl_secs.clamp(1, RESOURCE_TOKEN_MAX_TTL_SECS);
+    let jti = format!("rt-{}", crate::rand_token(128));
+    let mut payload = serde_json::json!({
+        "iss": req.resource,
+        "dwk": "aauth-resource.json",
+        "aud": req.aud,
+        "jti": jti,
+        "ps": req.ps,
+        "sub": req.sub,
+        "presented_jti": req.presented_jti,
+        "agent_jkt": req.agent_jkt,
+        "iat": now,
+        "exp": now + ttl,
+        "scope": req.scope,
+    });
+    if let Some(a) = req.account {
+        payload["account"] = serde_json::json!(a);
+    }
+    if let Some(m) = req.mission_s256 {
+        payload["mission_s256"] = serde_json::json!(m);
+    }
+    if let Some(t) = req.tenant {
+        payload["tenant"] = serde_json::json!(t);
+    }
+    (jwt::sign(TYP_RESOURCE, Some(kid), None, &payload, key), jti)
 }
 
 /// Full verification of an agent token against a known issuer key
@@ -296,6 +554,257 @@ mod tests {
         let payload = agent_claims(now, agent_jwk);
         let token = jwt::sign(TYP_AGENT, Some("k1"), None, &payload, &ap_key);
         validate_agent_token(&jwt::decode(&token).unwrap(), now, false).unwrap();
+    }
+
+    fn person_claims(now: u64, key_jwk: Jwk) -> serde_json::Value {
+        serde_json::json!({
+            "iss": "https://ps.example",
+            "dwk": "aauth-person.json",
+            "aud": "https://resource.example",
+            "sub": "8f14e45fceea167a5a36dedd4bea2543",
+            "cnf": {"jwk": key_jwk},
+            "jti": "pt-1",
+            "iat": now,
+            "exp": now + 1800,
+        })
+    }
+
+    #[test]
+    fn person_token_roundtrip_and_aud_pinning() {
+        let ps_key = generate_signing_key();
+        let now = 1_750_000_000u64;
+        let agent_jwk = Jwk::from_verifying_key(&generate_signing_key().verifying_key());
+        let token = jwt::sign(
+            TYP_PERSON,
+            Some("p1"),
+            None,
+            &person_claims(now, agent_jwk),
+            &ps_key,
+        );
+        let decoded = jwt::decode(&token).unwrap();
+        let claims =
+            validate_person_token(&decoded, now + 5, "https://resource.example", false).unwrap();
+        assert_eq!(claims.sub, "8f14e45fceea167a5a36dedd4bea2543");
+        // The same token at a different resource is refused on `aud`.
+        assert!(
+            validate_person_token(&decoded, now + 5, "https://other.example", false)
+                .unwrap_err()
+                .0
+                .contains("aud")
+        );
+    }
+
+    /// A person token MUST NOT carry `scope`/`account`, MUST NOT outlive one
+    /// hour, and its `typ` alone separates it from an auth token.
+    #[test]
+    fn person_token_guardrails() {
+        let ps_key = generate_signing_key();
+        let now = 1_750_000_000u64;
+        let agent_jwk = Jwk::from_verifying_key(&generate_signing_key().verifying_key());
+
+        let mut with_scope = person_claims(now, agent_jwk.clone());
+        with_scope["scope"] = serde_json::json!("data.read");
+        let t = jwt::sign(TYP_PERSON, Some("p1"), None, &with_scope, &ps_key);
+        let e = validate_person_token(
+            &jwt::decode(&t).unwrap(),
+            now,
+            "https://resource.example",
+            false,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("scope"), "got: {e}");
+
+        let mut long = person_claims(now, agent_jwk.clone());
+        long["exp"] = serde_json::json!(now + 2 * 3600);
+        let t = jwt::sign(TYP_PERSON, Some("p1"), None, &long, &ps_key);
+        let e = validate_person_token(
+            &jwt::decode(&t).unwrap(),
+            now,
+            "https://resource.example",
+            false,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("ceiling"), "got: {e}");
+
+        // An agent-typed JWT never validates as a person token.
+        let t = jwt::sign(
+            TYP_AGENT,
+            Some("p1"),
+            None,
+            &person_claims(now, agent_jwk),
+            &ps_key,
+        );
+        let e = validate_person_token(
+            &jwt::decode(&t).unwrap(),
+            now,
+            "https://resource.example",
+            false,
+        )
+        .unwrap_err();
+        assert!(e.0.contains("typ"), "got: {e}");
+    }
+
+    fn auth_claims(now: u64, key_jwk: Jwk) -> serde_json::Value {
+        serde_json::json!({
+            "iss": "https://ps.example",
+            "dwk": "aauth-person.json",
+            "aud": "https://resource.example",
+            "jti": "at-1",
+            "ps": "https://ps.example",
+            "sub": "8f14e45fceea167a5a36dedd4bea2543",
+            "cnf": {"jwk": key_jwk},
+            "iat": now,
+            "exp": now + 900,
+            "scope": "tools:read tools:write",
+            "mission_s256": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+        })
+    }
+
+    #[test]
+    fn auth_token_roundtrip_scopes_and_guardrails() {
+        let ps_key = generate_signing_key();
+        let now = 1_750_000_000u64;
+        let agent_jwk = Jwk::from_verifying_key(&generate_signing_key().verifying_key());
+        let ok = jwt::sign(
+            TYP_AUTH,
+            Some("p1"),
+            None,
+            &auth_claims(now, agent_jwk.clone()),
+            &ps_key,
+        );
+        let claims = validate_auth_token(
+            &jwt::decode(&ok).unwrap(),
+            now + 5,
+            "https://resource.example",
+            "aauth-person.json",
+            false,
+        )
+        .unwrap();
+        assert_eq!(claims.scopes(), vec!["tools:read", "tools:write"]);
+        assert_eq!(claims.ps, "https://ps.example");
+
+        // Wrong dwk expectation (an AS-issued token presented as PS-issued).
+        assert!(
+            validate_auth_token(
+                &jwt::decode(&ok).unwrap(),
+                now,
+                "https://resource.example",
+                "aauth-access.json",
+                false
+            )
+            .unwrap_err()
+            .0
+            .contains("dwk")
+        );
+        // Wrong audience.
+        assert!(
+            validate_auth_token(
+                &jwt::decode(&ok).unwrap(),
+                now,
+                "https://other.example",
+                "aauth-person.json",
+                false
+            )
+            .unwrap_err()
+            .0
+            .contains("aud")
+        );
+        // ps must equal iss when PS-issued.
+        let mut c = auth_claims(now, agent_jwk.clone());
+        c["ps"] = serde_json::json!("https://elsewhere.example");
+        let t = jwt::sign(TYP_AUTH, Some("p1"), None, &c, &ps_key);
+        assert!(
+            validate_auth_token(
+                &jwt::decode(&t).unwrap(),
+                now,
+                "https://resource.example",
+                "aauth-person.json",
+                false
+            )
+            .unwrap_err()
+            .0
+            .contains("ps")
+        );
+        // Over one hour.
+        let mut c = auth_claims(now, agent_jwk.clone());
+        c["exp"] = serde_json::json!(now + 7200);
+        let t = jwt::sign(TYP_AUTH, Some("p1"), None, &c, &ps_key);
+        assert!(
+            validate_auth_token(
+                &jwt::decode(&t).unwrap(),
+                now,
+                "https://resource.example",
+                "aauth-person.json",
+                false
+            )
+            .unwrap_err()
+            .0
+            .contains("ceiling")
+        );
+        // A person token never validates as an auth token.
+        let t = jwt::sign(
+            TYP_PERSON,
+            Some("p1"),
+            None,
+            &auth_claims(now, agent_jwk),
+            &ps_key,
+        );
+        assert!(
+            validate_auth_token(
+                &jwt::decode(&t).unwrap(),
+                now,
+                "https://resource.example",
+                "aauth-person.json",
+                false
+            )
+            .unwrap_err()
+            .0
+            .contains("typ")
+        );
+    }
+
+    #[test]
+    fn resource_token_roundtrip_and_ttl_clamp() {
+        let res_key = generate_signing_key();
+        let res_jwk = Jwk::from_verifying_key(&res_key.verifying_key());
+        let now = 1_750_000_000u64;
+        let (token, jti) = issue_resource_token(
+            &ResourceTokenRequest {
+                resource: "https://gw.example",
+                aud: "https://ps.example",
+                ps: "https://ps.example",
+                sub: "8f14e45fceea167a5a36dedd4bea2543",
+                presented_jti: "pt-1",
+                agent_jkt: "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k",
+                scope: "tools:read",
+                account: None,
+                mission_s256: Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+                tenant: None,
+                ttl_secs: 99_999, // clamped to the 5-minute ceiling
+            },
+            "gw-k1",
+            &res_key,
+            now,
+        );
+        let decoded = jwt::decode(&token).unwrap();
+        jwt::verify_with_jwk(&decoded, &res_jwk).unwrap();
+        assert_eq!(decoded.header.typ.as_deref(), Some(TYP_RESOURCE));
+        assert_eq!(decoded.header.kid.as_deref(), Some("gw-k1"));
+        assert_eq!(decoded.payload["jti"], jti);
+        assert!(jti.starts_with("rt-"));
+        assert_eq!(decoded.payload["dwk"], "aauth-resource.json");
+        assert_eq!(decoded.payload["aud"], "https://ps.example");
+        assert_eq!(decoded.payload["presented_jti"], "pt-1");
+        assert_eq!(decoded.payload["scope"], "tools:read");
+        assert_eq!(
+            decoded.payload["mission_s256"],
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        );
+        assert!(decoded.payload.get("account").is_none());
+        assert_eq!(
+            decoded.payload["exp"].as_u64().unwrap() - now,
+            RESOURCE_TOKEN_MAX_TTL_SECS
+        );
     }
 
     #[test]

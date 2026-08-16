@@ -13,10 +13,10 @@
 //!   [`crate::sigkey::SigKeyScheme`] (possibly fetching a JWKS) and then
 //!   calls [`verify_parsed`].
 
-use ed25519_dalek::{Signature, Signer, SigningKey};
+use ed25519_dalek::{Signer, SigningKey};
 
 use crate::b64;
-use crate::jwk::Jwk;
+use crate::jwk::{Jwk, JwkError, SigCheckError};
 use crate::sfv::{self, BareItem, MemberValue};
 use crate::sigkey::SigKeyScheme;
 
@@ -24,15 +24,18 @@ use crate::sigkey::SigKeyScheme;
 pub const REQUIRED_COMPONENTS: [&str; 4] = ["@method", "@authority", "@path", "signature-key"];
 
 /// Machine-readable error codes for the `Signature-Error` response header
-/// (`draft-hardt-httpbis-signature-key` §5.4).
+/// (`draft-hardt-httpbis-signature-key-08` error-code registry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigErrorCode {
     UnsupportedAlgorithm,
+    UnsupportedScheme,
     InvalidSignature,
     InvalidInput,
     InvalidRequest,
     InvalidKey,
     UnknownKey,
+    IssuerMissing,
+    IssuerMismatch,
     InvalidJwt,
     ExpiredJwt,
 }
@@ -41,11 +44,14 @@ impl SigErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             SigErrorCode::UnsupportedAlgorithm => "unsupported_algorithm",
+            SigErrorCode::UnsupportedScheme => "unsupported_scheme",
             SigErrorCode::InvalidSignature => "invalid_signature",
             SigErrorCode::InvalidInput => "invalid_input",
             SigErrorCode::InvalidRequest => "invalid_request",
             SigErrorCode::InvalidKey => "invalid_key",
             SigErrorCode::UnknownKey => "unknown_key",
+            SigErrorCode::IssuerMissing => "issuer_missing",
+            SigErrorCode::IssuerMismatch => "issuer_mismatch",
             SigErrorCode::InvalidJwt => "invalid_jwt",
             SigErrorCode::ExpiredJwt => "expired_jwt",
         }
@@ -104,16 +110,18 @@ pub struct VerifyPolicy {
 }
 
 /// A parsed, structurally-validated signature; crypto not yet checked.
+///
+/// The RFC 9421 `alg`, `keyid`, `nonce`, and `tag` signature parameters are
+/// deliberately not surfaced: under the JOSE signing algorithms this profile
+/// uses, the algorithm is signaled by the key and verifiers MUST ignore the
+/// `alg` parameter (signature-key-08 "Algorithm Selection"); the key is
+/// identified by `Signature-Key`, so `keyid` has nothing to name.
 #[derive(Debug, Clone)]
 pub struct ParsedSignature {
     pub label: String,
     pub covered: Vec<String>,
     pub created: i64,
     pub scheme: SigKeyScheme,
-    /// The `alg` parameter from `Signature-Input`, if the signer included one.
-    /// Optional per RFC 9421; when present it MUST be consistent with the key
-    /// material (checked in [`verify_parsed`]).
-    pub alg: Option<String>,
     /// The exact signature base string to verify.
     pub base: String,
     pub signature: Vec<u8>,
@@ -306,10 +314,6 @@ pub fn parse_request_signature(
         }
     };
 
-    let alg = sfv::param(params, "alg")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
     let base = build_signature_base(&covered, &input_member.raw, parts)?;
 
     Ok(ParsedSignature {
@@ -317,48 +321,84 @@ pub fn parse_request_signature(
         covered,
         created,
         scheme,
-        alg,
         base,
         signature,
     })
 }
 
-/// Verify the signature bytes against a resolved Ed25519 key.
+/// Verify the signature bytes against a resolved key. The algorithm comes
+/// from the key's `alg` member alone (which must be present, fully specified,
+/// and consistent with `kty`/`crv`); any `alg` signature parameter on the
+/// wire was already ignored at parse time.
 pub fn verify_parsed(parsed: &ParsedSignature, key: &Jwk) -> Result<(), SigError> {
-    if key.kty != "OKP" || key.crv != "Ed25519" {
-        let mut err = SigError::new(
-            SigErrorCode::UnsupportedAlgorithm,
-            "only ed25519 signatures are supported",
-        );
-        err.required_input = None;
-        return Err(err);
-    }
-    // RFC 9421 §6.4 / sigkey draft §6.4: the algorithm is derived from the key,
-    // but if the signer included an `alg` parameter it MUST be consistent with
-    // the key material. Our only key type is Ed25519 → `ed25519`.
-    if let Some(alg) = &parsed.alg
-        && alg != "ed25519"
-    {
-        return Err(SigError::new(
-            SigErrorCode::UnsupportedAlgorithm,
-            format!("Signature-Input alg '{alg}' is inconsistent with the Ed25519 key"),
-        ));
-    }
+    key.require_fully_specified_alg().map_err(|e| match e {
+        JwkError::InconsistentAlg => SigError::new(
+            SigErrorCode::InvalidKey,
+            "key `alg` disagrees with its `kty`/`crv`",
+        ),
+        other => SigError::new(SigErrorCode::UnsupportedAlgorithm, format!("{other}")),
+    })?;
     let vk = key
-        .verifying_key()
+        .verify_key()
         .map_err(|_| SigError::new(SigErrorCode::InvalidKey, "unparseable public key"))?;
-    let sig_bytes: [u8; 64] = parsed
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| SigError::new(SigErrorCode::InvalidSignature, "bad signature length"))?;
-    let sig = Signature::from_bytes(&sig_bytes);
-    vk.verify_strict(parsed.base.as_bytes(), &sig).map_err(|_| {
+    vk.verify(parsed.base.as_bytes(), &parsed.signature)
+        .map_err(|e| match e {
+            SigCheckError::BadLength => {
+                SigError::new(SigErrorCode::InvalidSignature, "bad signature length")
+            }
+            SigCheckError::Invalid => SigError::new(
+                SigErrorCode::InvalidSignature,
+                "signature verification failed",
+            ),
+        })
+}
+
+/// The RFC 9530 `Content-Digest` value for a body: `sha-256=:<base64>:`.
+pub fn content_digest_sha256(body: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body);
+    format!("sha-256=:{}:", b64::encode_std(&digest))
+}
+
+/// Verify a received `Content-Digest` header value against the body: every
+/// recognized member (`sha-256`, `sha-512`) MUST match, and at least one
+/// recognized member MUST be present. A covered `content-digest` binds the
+/// signature to the header VALUE only; this is the step that binds the value
+/// to the bytes.
+pub fn verify_content_digest(header_value: &str, body: &[u8]) -> Result<(), SigError> {
+    use sha2::Digest;
+    let dict = sfv::parse_dictionary(header_value).map_err(|e| {
         SigError::new(
             SigErrorCode::InvalidSignature,
-            "signature verification failed",
+            format!("Content-Digest: {e}"),
         )
-    })
+    })?;
+    let mut recognized = 0usize;
+    for (name, member) in &dict {
+        let expected: Option<Vec<u8>> = match name.as_str() {
+            "sha-256" => Some(sha2::Sha256::digest(body).to_vec()),
+            "sha-512" => Some(sha2::Sha512::digest(body).to_vec()),
+            _ => None,
+        };
+        let Some(expected) = expected else { continue };
+        recognized += 1;
+        match &member.value {
+            MemberValue::Item(BareItem::Bytes(got), _) if *got == expected => {}
+            _ => {
+                return Err(SigError::new(
+                    SigErrorCode::InvalidSignature,
+                    format!("Content-Digest {name} does not match the body"),
+                ));
+            }
+        }
+    }
+    if recognized == 0 {
+        return Err(SigError::new(
+            SigErrorCode::InvalidSignature,
+            "Content-Digest carries no recognized algorithm (sha-256 / sha-512)",
+        ));
+    }
+    Ok(())
 }
 
 /// The three headers produced by signing a request.
@@ -470,6 +510,36 @@ mod tests {
             other => panic!("unexpected scheme {other:?}"),
         }
         verify_parsed(&parsed, &jwk).unwrap();
+    }
+
+    #[test]
+    fn content_digest_roundtrip_and_tamper() {
+        let body = br#"{"iss":"https://ps.example","jti":"at-1"}"#;
+        let value = content_digest_sha256(body);
+        assert!(value.starts_with("sha-256=:"), "{value}");
+        verify_content_digest(&value, body).unwrap();
+        assert_eq!(
+            verify_content_digest(&value, b"tampered").unwrap_err().code,
+            SigErrorCode::InvalidSignature
+        );
+        // Unrecognized-only algorithms cannot bind the body.
+        assert!(verify_content_digest("md5=:AAAA:", body).is_err());
+        // An unrecognized member alongside a matching sha-256 is fine.
+        verify_content_digest(&format!("md5=:AAAA:, {value}"), body).unwrap();
+    }
+
+    #[test]
+    fn jwks_uri_scheme_serializes_and_parses() {
+        let member = sigkey::serialize_jwks_uri("https://ps.example", "aauth-person.json", "ps-1");
+        let d = sfv::parse_dictionary(&format!("sig={member}")).unwrap();
+        match sigkey::parse_member(&d[0].1.value).unwrap() {
+            SigKeyScheme::JwksUri { id, dwk, kid } => {
+                assert_eq!(id, "https://ps.example");
+                assert_eq!(dwk, "aauth-person.json");
+                assert_eq!(kid, "ps-1");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -637,35 +707,63 @@ mod tests {
         assert_eq!(err.code, SigErrorCode::InvalidRequest);
     }
 
+    /// signature-key-08 "Algorithm Selection": signers MUST NOT send the
+    /// RFC 9421 `alg` signature parameter and verifiers MUST ignore it if
+    /// present. A request carrying one — under ANY value, including a JOSE
+    /// spelling or garbage — verifies exactly as if it were absent, because
+    /// the algorithm comes from the key alone. `keyid`, `nonce`, and `tag`
+    /// take the same ignored path.
     #[test]
-    fn alg_consistency_enforced() {
+    fn alg_and_keyid_params_are_ignored() {
         let sk = generate_signing_key();
         let jwk = Jwk::from_verifying_key(&sk.verifying_key());
-        // An `alg` inconsistent with the Ed25519 key is rejected up front,
-        // before signature bytes are even checked.
-        let inconsistent = ParsedSignature {
-            label: "sig".into(),
-            covered: vec![],
-            created: 0,
-            scheme: SigKeyScheme::Hwk(jwk.clone()),
-            alg: Some("ecdsa-p256-sha256".into()),
-            base: "irrelevant".into(),
-            signature: vec![0u8; 64],
-        };
-        assert_eq!(
-            verify_parsed(&inconsistent, &jwk).unwrap_err().code,
-            SigErrorCode::UnsupportedAlgorithm
-        );
+        let now = 1_750_000_000u64;
+        for params in [
+            format!("created={now};alg=\"ed25519\""),
+            format!("created={now};alg=\"Ed25519\""),
+            format!("created={now};alg=\"rsa-pss-sha512\""),
+            format!("created={now};keyid=\"k1\";nonce=\"n\";tag=\"t\""),
+        ] {
+            let raw = format!("(\"@method\" \"@authority\" \"@path\" \"signature-key\");{params}");
+            let sig_key_member = sigkey::serialize_hwk(&jwk);
+            let sig_key_header = format!("sig={sig_key_member}");
+            let skh = sig_key_header.clone();
+            let lookup = move |name: &str| (name == "signature-key").then(|| skh.clone());
+            let parts_for_base = RequestParts {
+                method: "GET",
+                authority: "a.example",
+                path: "/x",
+                query: "",
+                header: &lookup,
+            };
+            let covered: Vec<String> = REQUIRED_COMPONENTS.iter().map(|s| s.to_string()).collect();
+            let base = build_signature_base(&covered, &raw, &parts_for_base).unwrap();
+            let sig = sk.sign(base.as_bytes());
 
-        // A consistent `alg` passes the consistency gate and proceeds to the
-        // (here failing) signature check.
-        let consistent = ParsedSignature {
-            alg: Some("ed25519".into()),
-            ..inconsistent
-        };
-        assert_eq!(
-            verify_parsed(&consistent, &jwk).unwrap_err().code,
-            SigErrorCode::InvalidSignature
-        );
+            let mut all = HashMap::new();
+            all.insert("signature-input".to_string(), format!("sig={raw}"));
+            all.insert(
+                "signature".to_string(),
+                format!("sig=:{}:", crate::b64::encode_std(&sig.to_bytes())),
+            );
+            all.insert("signature-key".to_string(), sig_key_header.clone());
+            let lookup2 = move |name: &str| all.get(name).cloned();
+            let parts = RequestParts {
+                method: "GET",
+                authority: "a.example",
+                path: "/x",
+                query: "",
+                header: &lookup2,
+            };
+            let policy = VerifyPolicy {
+                now,
+                window_secs: 60,
+                extra_required: vec![],
+            };
+            let parsed = parse_request_signature(&parts, &policy)
+                .unwrap_or_else(|e| panic!("params `{params}` must parse: {e}"));
+            verify_parsed(&parsed, &jwk)
+                .unwrap_or_else(|e| panic!("params `{params}` must be ignored: {e}"));
+        }
     }
 }

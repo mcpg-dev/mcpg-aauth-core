@@ -74,28 +74,34 @@ pub fn parse_member(value: &MemberValue) -> Result<SigKeyScheme, SigError> {
                     format!("hwk `alg`: {e}"),
                 )
             })?;
-            if kty != "OKP" {
-                return Err(SigError::new(
-                    SigErrorCode::UnsupportedAlgorithm,
-                    "only OKP/Ed25519 keys are supported",
-                ));
-            }
             let crv = str_param(params, "crv")?;
             let x = str_param(params, "x")?;
-            if crv != "Ed25519" {
-                return Err(SigError::new(
-                    SigErrorCode::UnsupportedAlgorithm,
-                    "only Ed25519 keys are supported",
-                ));
-            }
-            Ok(SigKeyScheme::Hwk(Jwk {
+            let y = match kty.as_str() {
+                // Ed25519 public keys have no Y coordinate.
+                "OKP" => None,
+                // EC keys carry both affine coordinates.
+                "EC" => Some(str_param(params, "y")?),
+                _ => {
+                    return Err(SigError::new(
+                        SigErrorCode::UnsupportedAlgorithm,
+                        "unsupported hwk key type (OKP/Ed25519 and EC/P-256 only)",
+                    ));
+                }
+            };
+            let jwk = Jwk {
                 kty,
                 crv,
                 x,
+                y,
                 kid: None,
                 alg: Some(alg),
                 use_: None,
-            }))
+            };
+            // alg/kty/crv agreement (and curve support) in one gate.
+            jwk.require_fully_specified_alg().map_err(|e| {
+                SigError::new(SigErrorCode::UnsupportedAlgorithm, format!("hwk key: {e}"))
+            })?;
+            Ok(SigKeyScheme::Hwk(jwk))
         }
         "jwt" => Ok(SigKeyScheme::Jwt(str_param(params, "jwt")?)),
         "jkt-jwt" => Ok(SigKeyScheme::JktJwt(str_param(params, "jwt")?)),
@@ -130,6 +136,17 @@ pub fn serialize_jwt(token: &str) -> String {
 /// Serialize a `jkt-jwt` member value.
 pub fn serialize_jkt_jwt(token: &str) -> String {
     format!("jkt-jwt;jwt={}", sfv::serialize_string(token))
+}
+
+/// Serialize a `jwks_uri` member value — how a server (PS, AS, resource)
+/// signs as itself: identity `id`, metadata document `dwk`, key `kid`.
+pub fn serialize_jwks_uri(id: &str, dwk: &str, kid: &str) -> String {
+    format!(
+        "jwks_uri;id={};dwk={};kid={}",
+        sfv::serialize_string(id),
+        sfv::serialize_string(dwk),
+        sfv::serialize_string(kid)
+    )
 }
 
 /// Result of verifying a `jkt-jwt` naming JWT.

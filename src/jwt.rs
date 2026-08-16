@@ -3,19 +3,17 @@
 // https://github.com/agentprovider/source-code @ 201118bd0da4b95cfc91f45c5e29ae5733d14aad.
 // Verify path for the mcpg dev.mcpg.identity.aauth plugin; see third_party/aauth-core/.
 
-//! Compact JWT (JWS) signing and verification, Ed25519 only.
+//! Compact JWT (JWS) verification for `Ed25519` and `ES256`; signing is
+//! Ed25519 only.
 //!
 //! AAuth `draft-hardt-oauth-aauth-protocol-10` §5.2.2 requires a fully
 //! specified signing algorithm and states that implementations MUST NOT accept
 //! `none`, the polymorphic `EdDSA` identifier, or any symmetric algorithm;
-//! `draft-hardt-httpbis-signature-key-08` §3.3 repeats the `EdDSA` ban. Only
-//! the fully-specified `Ed25519` is accepted here — `Ed448` is equally
-//! spec-permitted but has no backend in this build.
-//!
-//! The RFC 9421 `alg` parameter carried in `Signature-Input` is a different
-//! registry and is spelled lowercase `ed25519`; see [`crate::sig`].
+//! `draft-hardt-httpbis-signature-key-08` §3.3 repeats the `EdDSA` ban. The
+//! protocol makes `Ed25519` support a MUST and `ES256` a SHOULD; both verify
+//! here. `Ed448` is equally spec-permitted but has no backend in this build.
 
-use ed25519_dalek::{Signature, Signer, SigningKey};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 
 use crate::b64;
@@ -47,8 +45,15 @@ pub struct DecodedJwt {
 /// The fully-specified JOSE `alg` this build signs with and accepts.
 pub const ALG_ED25519: &str = "Ed25519";
 
-/// Fully specified and spec-permitted, but unimplemented here: the crate's only
-/// signature backend is `ed25519_dalek`.
+/// ECDSA P-256 with SHA-256 — the protocol's SHOULD-support algorithm, for
+/// agents whose hardware-backed keys are P-256. Verify-only in this build.
+pub const ALG_ES256: &str = "ES256";
+
+/// Every fully-specified algorithm this build's verifier implements.
+pub const SUPPORTED_ALGS: [&str; 2] = [ALG_ED25519, ALG_ES256];
+
+/// Fully specified and spec-permitted, but unimplemented here: this build's
+/// signature backends are Ed25519 and P-256.
 pub const ALG_ED448: &str = "Ed448";
 
 /// The polymorphic identifier AAuth -10 §5.2.2 and signature-key-08 §3.3 ban.
@@ -67,6 +72,9 @@ pub enum JwtError {
     /// same line (`invalid_key` vs `unsupported_algorithm`) and answers the
     /// negotiable case alone with `Accept-Signature-Alg`.
     KeyMissingAlg,
+    /// A JWK whose `alg` disagrees with its `kty`/`crv` — rejected rather than
+    /// used under either interpretation (`invalid_key` on the wire).
+    InconsistentKey,
     BadSignature,
 }
 
@@ -76,19 +84,24 @@ impl std::fmt::Display for JwtError {
             JwtError::Malformed => write!(f, "malformed JWT"),
             JwtError::UnsupportedAlgorithm => write!(
                 f,
-                "unsupported JWT `alg` (AAuth requires the fully-specified `{ALG_ED25519}`; \
-                 `none`, the polymorphic `{ALG_EDDSA_POLYMORPHIC}`, and symmetric algorithms \
-                 are rejected)"
+                "unsupported JWT `alg` (AAuth requires a fully-specified algorithm — \
+                 `{ALG_ED25519}` or `{ALG_ES256}` here; `none`, the polymorphic \
+                 `{ALG_EDDSA_POLYMORPHIC}`, and symmetric algorithms are rejected)"
             ),
             JwtError::UnimplementedAlgorithmEd448 => write!(
                 f,
                 "JWT `alg` is `{ALG_ED448}`: a valid AAuth algorithm, but this build implements \
-                 `{ALG_ED25519}` only"
+                 `{ALG_ED25519}` and `{ALG_ES256}` only"
             ),
             JwtError::KeyMissingAlg => write!(
                 f,
                 "JWK carries no `alg` member (signature-key-08 §3.3 requires one and forbids \
                  inferring it from `kty`/`crv`)"
+            ),
+            JwtError::InconsistentKey => write!(
+                f,
+                "JWK `alg` disagrees with the key's `kty`/`crv`; the key is refused rather than \
+                 used under either interpretation"
             ),
             JwtError::BadSignature => write!(f, "JWT signature verification failed"),
         }
@@ -96,11 +109,12 @@ impl std::fmt::Display for JwtError {
 }
 impl std::error::Error for JwtError {}
 
-/// Gate a JOSE `alg` against the AAuth -10 rule: fully specified, asymmetric,
-/// and implemented here. Rejects `none`, `EdDSA`, `HS*`, `RS*`, `ES*`, `PS*`.
+/// Gate a JOSE `alg` against the AAuth rule: fully specified, asymmetric,
+/// and implemented here. Accepts `Ed25519` and `ES256`; rejects `none`,
+/// `EdDSA`, `HS*`, `RS*`, `PS*`, and everything else.
 pub fn check_alg(alg: &str) -> Result<(), JwtError> {
     match alg {
-        ALG_ED25519 => Ok(()),
+        ALG_ED25519 | ALG_ES256 => Ok(()),
         ALG_ED448 => Err(JwtError::UnimplementedAlgorithmEd448),
         _ => Err(JwtError::UnsupportedAlgorithm),
     }
@@ -131,22 +145,23 @@ pub fn decode(token: &str) -> Result<DecodedJwt, JwtError> {
     })
 }
 
-/// Verify a decoded JWT's signature against an Ed25519 JWK.
-/// Enforces the fully-specified `alg` rule via [`check_alg`].
+/// Verify a decoded JWT's signature against a JWK (`Ed25519` or `ES256`).
+/// Enforces the fully-specified `alg` rule via [`check_alg`] on the header
+/// and [`Jwk::require_fully_specified_alg`] on the key, and requires the two
+/// to name the SAME algorithm — the key signals the operation, and a header
+/// that asks for a different one is refused before any cryptography.
 pub fn verify_with_jwk(jwt: &DecodedJwt, key: &Jwk) -> Result<(), JwtError> {
     check_alg(&jwt.header.alg)?;
     key.require_fully_specified_alg().map_err(|e| match e {
         super::jwk::JwkError::MissingAlg => JwtError::KeyMissingAlg,
+        super::jwk::JwkError::InconsistentAlg => JwtError::InconsistentKey,
         _ => JwtError::UnsupportedAlgorithm,
     })?;
-    let vk = key.verifying_key().map_err(|_| JwtError::BadSignature)?;
-    let sig_bytes: [u8; 64] = jwt
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| JwtError::BadSignature)?;
-    let sig = Signature::from_bytes(&sig_bytes);
-    vk.verify_strict(jwt.signing_input.as_bytes(), &sig)
+    if key.alg.as_deref() != Some(jwt.header.alg.as_str()) {
+        return Err(JwtError::UnsupportedAlgorithm);
+    }
+    let vk = key.verify_key().map_err(|_| JwtError::BadSignature)?;
+    vk.verify(jwt.signing_input.as_bytes(), &jwt.signature)
         .map_err(|_| JwtError::BadSignature)
 }
 
@@ -271,12 +286,50 @@ mod tests {
         }
     }
 
-    /// Other asymmetric JOSE algorithms have no backend and are not AAuth.
+    /// Asymmetric JOSE algorithms outside the supported pair are refused.
     #[test]
     fn other_asymmetric_algs_rejected() {
-        for alg in ["RS256", "PS256", "ES256", "ES256K"] {
+        for alg in ["RS256", "PS256", "ES384", "ES256K"] {
             assert_eq!(check_alg(alg), Err(JwtError::UnsupportedAlgorithm));
         }
+        // The SHOULD-support algorithm clears the gate.
+        check_alg("ES256").unwrap();
+    }
+
+    /// An ES256 JWT verifies under a P-256 JWKS key, and the header/key
+    /// algorithms must agree — an Ed25519 header over a P-256 key is refused
+    /// before any cryptography.
+    #[test]
+    fn es256_jwt_roundtrip_and_alg_agreement() {
+        use p256::ecdsa::signature::Signer as _;
+        let seed = [7u8; 32];
+        let sk = p256::ecdsa::SigningKey::from_slice(&seed).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let jwk = Jwk {
+            kty: "EC".into(),
+            crv: "P-256".into(),
+            x: crate::b64::encode(point.x().unwrap()),
+            y: Some(crate::b64::encode(point.y().unwrap())),
+            kid: None,
+            alg: Some(ALG_ES256.into()),
+            use_: None,
+        };
+        let h = crate::b64::encode(br#"{"alg":"ES256","typ":"aa-agent+jwt"}"#);
+        let p = crate::b64::encode(br#"{"iss":"https://x.example"}"#);
+        let signing_input = format!("{h}.{p}");
+        let sig: p256::ecdsa::Signature = sk.sign(signing_input.as_bytes());
+        let token = format!("{signing_input}.{}", crate::b64::encode(&sig.to_bytes()));
+        let decoded = decode(&token).unwrap();
+        verify_with_jwk(&decoded, &jwk).unwrap();
+
+        // Same signature, header claiming Ed25519: header/key disagreement.
+        let h2 = crate::b64::encode(br#"{"alg":"Ed25519","typ":"aa-agent+jwt"}"#);
+        let tampered = format!("{h2}.{p}.{}", crate::b64::encode(&sig.to_bytes()));
+        let decoded2 = decode(&tampered).unwrap();
+        assert_eq!(
+            verify_with_jwk(&decoded2, &jwk),
+            Err(JwtError::UnsupportedAlgorithm)
+        );
     }
 
     /// `Ed448` is spec-permitted; this build cannot do it. The distinct error
