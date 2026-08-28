@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-aauth-core"
-version = "0.1.0-beta.15"
+version = "0.1.0-beta.16"
 edition = "2024"
 license = "Apache-2.0"
 description = "AAuth protocol primitives — Ed25519/ES256 JWKs/JWTs, RFC 9421 request signing and verification, Signature-Key schemes"
