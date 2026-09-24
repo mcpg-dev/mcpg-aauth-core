@@ -304,7 +304,7 @@ mod tests {
         use p256::ecdsa::signature::Signer as _;
         let seed = [7u8; 32];
         let sk = p256::ecdsa::SigningKey::from_slice(&seed).unwrap();
-        let point = sk.verifying_key().to_encoded_point(false);
+        let point = sk.verifying_key().to_sec1_point(false);
         let jwk = Jwk {
             kty: "EC".into(),
             crv: "P-256".into(),

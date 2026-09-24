@@ -132,12 +132,9 @@ impl Jwk {
                 let x_raw: [u8; 32] =
                     b64::decode_fixed(&self.x).map_err(|_| JwkError::InvalidKey)?;
                 let y_raw: [u8; 32] = b64::decode_fixed(y).map_err(|_| JwkError::InvalidKey)?;
-                let point = p256::EncodedPoint::from_affine_coordinates(
-                    &x_raw.into(),
-                    &y_raw.into(),
-                    false,
-                );
-                let vk = p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+                let point =
+                    p256::Sec1Point::from_affine_coordinates(&x_raw.into(), &y_raw.into(), false);
+                let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(point.as_bytes())
                     .map_err(|_| JwkError::InvalidKey)?;
                 Ok(VerifyKey::P256(vk))
             }
@@ -369,9 +366,10 @@ mod tests {
     #[test]
     fn p256_key_parses_and_verifies() {
         use p256::ecdsa::signature::Signer;
-        let sk = p256::ecdsa::SigningKey::random(&mut rand_core_for_test());
+        use p256::elliptic_curve::Generate;
+        let sk = p256::ecdsa::SigningKey::generate_from_rng(&mut rand_core_for_test());
         let vk = sk.verifying_key();
-        let point = vk.to_encoded_point(false);
+        let point = vk.to_sec1_point(false);
         let jwk = Jwk {
             kty: "EC".into(),
             crv: "P-256".into(),
@@ -394,34 +392,38 @@ mod tests {
 
     /// Deterministic RNG for tests only (the crate forbids ambient entropy in
     /// scripts; tests seed from a fixed value).
-    fn rand_core_for_test() -> impl p256::elliptic_curve::rand_core::CryptoRngCore {
+    fn rand_core_for_test() -> impl p256::elliptic_curve::rand_core::CryptoRng {
+        use p256::elliptic_curve::rand_core::{TryCryptoRng, TryRng};
+
         struct Fixed(u64);
-        impl p256::elliptic_curve::rand_core::RngCore for Fixed {
-            fn next_u32(&mut self) -> u32 {
-                self.next_u64() as u32
-            }
-            fn next_u64(&mut self) -> u64 {
+        impl Fixed {
+            fn step(&mut self) -> u64 {
                 // xorshift64 — deterministic, non-cryptographic, test-only.
                 self.0 ^= self.0 << 13;
                 self.0 ^= self.0 >> 7;
                 self.0 ^= self.0 << 17;
                 self.0
             }
-            fn fill_bytes(&mut self, dest: &mut [u8]) {
+        }
+        // An infallible `TryRng` is an `Rng`, and the crypto marker makes it
+        // the `CryptoRng` the key generators ask for.
+        impl TryRng for Fixed {
+            type Error = core::convert::Infallible;
+            fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+                Ok(self.step() as u32)
+            }
+            fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+                Ok(self.step())
+            }
+            fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
                 for chunk in dest.chunks_mut(8) {
-                    let v = self.next_u64().to_le_bytes();
+                    let v = self.step().to_le_bytes();
                     chunk.copy_from_slice(&v[..chunk.len()]);
                 }
-            }
-            fn try_fill_bytes(
-                &mut self,
-                dest: &mut [u8],
-            ) -> Result<(), p256::elliptic_curve::rand_core::Error> {
-                self.fill_bytes(dest);
                 Ok(())
             }
         }
-        impl p256::elliptic_curve::rand_core::CryptoRng for Fixed {}
+        impl TryCryptoRng for Fixed {}
         Fixed(0x1234_5678_9abc_def0)
     }
 

@@ -1,16 +1,16 @@
 [package]
 name = "mcpg-aauth-core"
-version = "0.1.0-beta.28"
+version = "0.1.0-beta.34"
 edition = "2024"
 license = "Apache-2.0"
 description = "AAuth protocol primitives — Ed25519/ES256 JWKs/JWTs, RFC 9421 request signing and verification, Signature-Key schemes"
 
 [dependencies]
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }
-getrandom = "0.3"
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "fast", "zeroize"] }
+getrandom = "0.4"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
